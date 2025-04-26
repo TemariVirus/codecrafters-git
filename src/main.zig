@@ -1,5 +1,6 @@
 const std = @import("std");
 const fs = std.fs;
+const AnyWriter = std.io.AnyWriter;
 
 var gpa: std.heap.DebugAllocator(.{}) = .init;
 
@@ -7,9 +8,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const stdout_raw = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_raw);
-    const stdout = bw.writer().any();
+    const stdout = std.io.getStdOut().writer().any();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -28,15 +27,31 @@ pub fn main() !void {
             return;
         }
         try catFile(stdout, args[3]);
+    } else if (strEql(command, "hash-object")) {
+        if (args.len < 3) {
+            try std.io.getStdErr().writer().print("Usage: {s} hash-object [-w] <file>\n", .{args[0]});
+            return;
+        }
+
+        var write = false;
+        var file: []const u8 = undefined;
+        for (args[2..]) |arg| {
+            if (strEql(arg, "-w")) {
+                write = true;
+            } else {
+                file = arg;
+            }
+        }
+
+        try hashObject(stdout, file, write);
     }
-    try bw.flush();
 }
 
 fn strEql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn init(stdout: std.io.AnyWriter) !void {
+fn init(stdout: AnyWriter) !void {
     const cwd = fs.cwd();
     _ = try cwd.makeDir("./.git");
     _ = try cwd.makeDir("./.git/objects");
@@ -49,7 +64,7 @@ fn init(stdout: std.io.AnyWriter) !void {
     _ = try stdout.writeAll("Initialized git directory\n");
 }
 
-fn catFile(stdout: std.io.AnyWriter, hash: []const u8) !void {
+fn catFile(stdout: AnyWriter, hash: []const u8) !void {
     const allocator = gpa.allocator();
 
     const file = blk: {
@@ -68,5 +83,48 @@ fn catFile(stdout: std.io.AnyWriter, hash: []const u8) !void {
         const n = try de.reader().readAll(&buf);
         if (n == 0) break;
         try stdout.writeAll(buf[0..n]);
+    }
+}
+
+fn hashObject(stdout: AnyWriter, file_path: []const u8, write: bool) !void {
+    const allocator = gpa.allocator();
+
+    const file = try fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    const stat = try file.stat();
+
+    const header = try std.fmt.allocPrint(allocator, "blob {d}\x00", .{stat.size});
+    defer allocator.free(header);
+
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update(header);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try file.reader().readAll(&buf);
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+
+    const hash = std.fmt.bytesToHex(hasher.finalResult(), .lower);
+    try stdout.print("{s}\n", .{hash});
+
+    if (write) {
+        const path = try std.fmt.allocPrint(allocator, ".git/objects/{s}/{s}", .{ hash[0..2], hash[2..] });
+        defer allocator.free(path);
+        try fs.cwd().makePath(path[0..".git/objects/00".len]);
+        const obj = try fs.cwd().createFile(path, .{});
+        defer obj.close();
+
+        try file.seekTo(0);
+        buf = undefined;
+        var compressor = try std.compress.zlib.compressor(obj.writer(), .{});
+
+        _ = try compressor.write(header);
+        while (true) {
+            const n = try file.reader().readAll(&buf);
+            if (n == 0) break;
+            _ = try compressor.write(buf[0..n]);
+        }
+        _ = try compressor.finish();
     }
 }
