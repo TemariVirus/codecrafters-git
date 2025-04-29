@@ -1,20 +1,23 @@
 const std = @import("std");
 const fs = std.fs;
+const AnyReader = std.io.AnyReader;
 const AnyWriter = std.io.AnyWriter;
 
 var gpa: std.heap.DebugAllocator(.{}) = .init;
+const PAGE_SIZE = 4096;
 
 pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer().any();
+    const stderr = std.io.getStdErr().writer().any();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        try std.io.getStdErr().writer().print("Usage: {s} <command>\n", .{args[0]});
+        try stderr.print("Usage: {s} <command>\n", .{args[0]});
         return;
     }
 
@@ -23,13 +26,13 @@ pub fn main() !void {
         try init(stdout);
     } else if (strEql(command, "cat-file")) {
         if (args.len < 4 or !strEql(args[2], "-p")) {
-            try std.io.getStdErr().writer().print("Usage: {s} cat-file -p <hash>\n", .{args[0]});
+            try stderr.print("Usage: {s} cat-file -p <hash>\n", .{args[0]});
             return;
         }
         try catFile(stdout, args[3]);
     } else if (strEql(command, "hash-object")) {
         if (args.len < 3) {
-            try std.io.getStdErr().writer().print("Usage: {s} hash-object [-w] <file>\n", .{args[0]});
+            try stderr.print("Usage: {s} hash-object [-w] <file>\n", .{args[0]});
             return;
         }
 
@@ -46,7 +49,7 @@ pub fn main() !void {
         try hashObject(stdout, file, write);
     } else if (strEql(command, "ls-tree")) {
         if (args.len < 3) {
-            try std.io.getStdErr().writer().print("Usage: {s} ls-tree [--name-only] <hash>\n", .{args[0]});
+            try stderr.print("Usage: {s} ls-tree [--name-only] <hash>\n", .{args[0]});
             return;
         }
 
@@ -61,6 +64,9 @@ pub fn main() !void {
         }
 
         try lsTree(stdout, hash, name_only);
+    } else {
+        try stderr.print("Unknown command: {s}\n", .{command});
+        return;
     }
 }
 
@@ -78,6 +84,35 @@ fn objectPath(hash: [40]u8) [54]u8 {
     var buf: [54]u8 = undefined;
     _ = std.fmt.bufPrint(&buf, ".git/objects/{s}/{s}", .{ hash[0..2], hash[2..] }) catch unreachable;
     return buf;
+}
+
+fn writeBlobHeader(writer: AnyWriter, file_size: u64) !void {
+    try writer.print("blob {d}\x00", .{file_size});
+}
+
+fn blobHash(reader: AnyReader, file_size: u64) ![20]u8 {
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    writeBlobHeader(hasher.writer().any(), file_size) catch unreachable;
+
+    var buf: [PAGE_SIZE]u8 = undefined;
+    while (true) {
+        const n = try reader.readAll(&buf);
+        hasher.update(buf[0..n]);
+        if (n < buf.len) break;
+    }
+    return hasher.finalResult();
+}
+
+fn blobWrite(reader: AnyReader, file_size: u64, hash: [40]u8) !void {
+    const path = objectPath(hash);
+    try fs.cwd().makePath(fs.path.dirname(&path).?);
+    const obj = try fs.cwd().createFile(&path, .{});
+    defer obj.close();
+
+    var compressor = try std.compress.zlib.compressor(obj.writer(), .{});
+    try writeBlobHeader(compressor.writer().any(), file_size);
+    try compressor.compress(reader);
+    try compressor.finish();
 }
 
 fn init(stdout: AnyWriter) !void {
@@ -113,44 +148,17 @@ fn catFile(stdout: AnyWriter, hash: []const u8) !void {
 }
 
 fn hashObject(stdout: AnyWriter, file_path: []const u8, write: bool) !void {
-    const allocator = gpa.allocator();
-
     const file = try fs.cwd().openFile(file_path, .{});
     defer file.close();
     const stat = try file.stat();
 
-    const header = try std.fmt.allocPrint(allocator, "blob {d}\x00", .{stat.size});
-    defer allocator.free(header);
-
-    var hasher = std.crypto.hash.Sha1.init(.{});
-    hasher.update(header);
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try file.reader().readAll(&buf);
-        if (n == 0) break;
-        hasher.update(buf[0..n]);
-    }
-
-    const hash = std.fmt.bytesToHex(hasher.finalResult(), .lower);
+    const raw_hash = try blobHash(file.reader().any(), stat.size);
+    const hash = std.fmt.bytesToHex(raw_hash, .lower);
     try stdout.print("{s}\n", .{hash});
 
     if (write) {
-        const path = objectPath(hash);
-        try fs.cwd().makePath(&objectDir(hash));
-        const obj = try fs.cwd().createFile(&path, .{});
-        defer obj.close();
-
         try file.seekTo(0);
-        buf = undefined;
-        var compressor = try std.compress.zlib.compressor(obj.writer(), .{});
-
-        _ = try compressor.write(header);
-        while (true) {
-            const n = try file.reader().readAll(&buf);
-            if (n == 0) break;
-            _ = try compressor.write(buf[0..n]);
-        }
-        _ = try compressor.finish();
+        try blobWrite(file.reader().any(), stat.size, hash);
     }
 }
 
