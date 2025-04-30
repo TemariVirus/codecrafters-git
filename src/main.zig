@@ -118,6 +118,13 @@ fn blobHash(reader: AnyReader, file_size: u64) ![20]u8 {
 
 fn blobWrite(reader: AnyReader, file_size: u64, hash: [40]u8) !void {
     const path = objectPath(hash);
+    if (fs.cwd().access(&path, .{})) {
+        // File already exists, no need to write it again
+        return;
+    } else |err| {
+        std.mem.doNotOptimizeAway(err);
+    }
+
     try fs.cwd().makePath(fs.path.dirname(&path).?);
     const obj = try fs.cwd().createFile(&path, .{});
     defer obj.close();
@@ -224,6 +231,13 @@ fn treeWrite(allocator: std.mem.Allocator, dir: fs.Dir) ![20]u8 {
     const hash = std.fmt.bytesToHex(raw_hash, .lower);
 
     const path = objectPath(hash);
+    if (fs.cwd().access(&path, .{})) {
+        // File already exists, no need to write it again
+        return raw_hash;
+    } else |err| {
+        std.mem.doNotOptimizeAway(err);
+    }
+
     try fs.cwd().makePath(fs.path.dirname(&path).?);
     const tree = try fs.cwd().createFile(&path, .{});
     defer tree.close();
