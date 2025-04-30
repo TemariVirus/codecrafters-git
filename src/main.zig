@@ -6,6 +6,17 @@ const AnyWriter = std.io.AnyWriter;
 var gpa: std.heap.DebugAllocator(.{}) = .init;
 const PAGE_SIZE = 4096;
 
+const ObjectType = enum {
+    blob,
+    tree,
+};
+
+const TreeEntry = struct {
+    mode: fs.File.Mode,
+    name: []const u8,
+    hash: [20]u8,
+};
+
 pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -64,6 +75,8 @@ pub fn main() !void {
         }
 
         try lsTree(stdout, hash, name_only);
+    } else if (strEql(command, "write-tree")) {
+        try writeTree(stdout);
     } else {
         try stderr.print("Unknown command: {s}\n", .{command});
         return;
@@ -86,13 +99,13 @@ fn objectPath(hash: [40]u8) [54]u8 {
     return buf;
 }
 
-fn writeBlobHeader(writer: AnyWriter, file_size: u64) !void {
-    try writer.print("blob {d}\x00", .{file_size});
+fn writeObjectHeader(writer: AnyWriter, object_type: ObjectType, file_size: u64) !void {
+    try writer.print("{s} {d}\x00", .{ @tagName(object_type), file_size });
 }
 
 fn blobHash(reader: AnyReader, file_size: u64) ![20]u8 {
     var hasher = std.crypto.hash.Sha1.init(.{});
-    writeBlobHeader(hasher.writer().any(), file_size) catch unreachable;
+    writeObjectHeader(hasher.writer().any(), .blob, file_size) catch unreachable;
 
     var buf: [PAGE_SIZE]u8 = undefined;
     while (true) {
@@ -110,16 +123,123 @@ fn blobWrite(reader: AnyReader, file_size: u64, hash: [40]u8) !void {
     defer obj.close();
 
     var compressor = try std.compress.zlib.compressor(obj.writer(), .{});
-    try writeBlobHeader(compressor.writer().any(), file_size);
+    try writeObjectHeader(compressor.writer().any(), .blob, file_size);
     try compressor.compress(reader);
     try compressor.finish();
 }
 
+fn treeWriteEntriesOnly(writer: AnyWriter, entries: []const TreeEntry) !void {
+    for (entries) |entry| {
+        try writer.print("{d} {s}\x00{s}", .{ entry.mode, entry.name, entry.hash });
+    }
+}
+
+fn treeHash(entries: []const TreeEntry, size: u64) [20]u8 {
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    writeObjectHeader(hasher.writer().any(), .tree, size) catch unreachable;
+    treeWriteEntriesOnly(hasher.writer().any(), entries) catch unreachable;
+    return hasher.finalResult();
+}
+
+fn treeWrite(allocator: std.mem.Allocator, dir: fs.Dir) ![20]u8 {
+    const EMPTY_DIR_HASH = comptime blk: {
+        var hasher = std.crypto.hash.Sha1.init(.{});
+        writeObjectHeader(hasher.writer().any(), .tree, 0) catch unreachable;
+        break :blk hasher.finalResult();
+    };
+
+    var entries: std.ArrayList(TreeEntry) = .init(allocator);
+    defer {
+        for (entries.items) |entry| {
+            allocator.free(entry.name);
+        }
+        entries.deinit();
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        switch (entry.kind) {
+            .file => {
+                const file = try dir.openFile(entry.name, .{});
+                defer file.close();
+                const stat = try file.stat();
+
+                const raw_hash = try blobHash(file.reader().any(), stat.size);
+                const hash = std.fmt.bytesToHex(raw_hash, .lower);
+                try file.seekTo(0);
+                try blobWrite(file.reader().any(), stat.size, hash);
+
+                const name = try allocator.dupe(u8, entry.name);
+                errdefer allocator.free(name);
+                try entries.append(.{
+                    .mode = 100644,
+                    .name = name,
+                    .hash = raw_hash,
+                });
+            },
+            .directory => {
+                // Skip all .git directories
+                if (strEql(entry.name, ".git")) {
+                    continue;
+                }
+
+                var subdir = try dir.openDir(entry.name, .{ .iterate = true });
+                defer subdir.close();
+                const raw_hash = try treeWrite(allocator, subdir);
+
+                // Skip empty directories
+                if (std.mem.eql(u8, &raw_hash, &EMPTY_DIR_HASH)) {
+                    continue;
+                }
+
+                const name = try allocator.dupe(u8, entry.name);
+                errdefer allocator.free(name);
+                try entries.append(.{
+                    .mode = 40000,
+                    .name = name,
+                    .hash = raw_hash,
+                });
+            },
+            else => return error.UnsupportedEntryType,
+        }
+    }
+
+    // Skip empty directories
+    if (entries.items.len == 0) {
+        return EMPTY_DIR_HASH;
+    }
+
+    std.sort.pdq(TreeEntry, entries.items, {}, (struct {
+        fn lessThan(_: void, lhs: TreeEntry, rhs: TreeEntry) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }).lessThan);
+
+    const size = blk: {
+        var counter = std.io.countingWriter(std.io.null_writer);
+        treeWriteEntriesOnly(counter.writer().any(), entries.items) catch unreachable;
+        break :blk counter.bytes_written;
+    };
+    const raw_hash = treeHash(entries.items, size);
+    const hash = std.fmt.bytesToHex(raw_hash, .lower);
+
+    const path = objectPath(hash);
+    try fs.cwd().makePath(fs.path.dirname(&path).?);
+    const tree = try fs.cwd().createFile(&path, .{});
+    defer tree.close();
+
+    var compressor = try std.compress.zlib.compressor(tree.writer(), .{});
+    try writeObjectHeader(compressor.writer().any(), .tree, size);
+    try treeWriteEntriesOnly(compressor.writer().any(), entries.items);
+    try compressor.finish();
+
+    return raw_hash;
+}
+
 fn init(stdout: AnyWriter) !void {
     const cwd = fs.cwd();
-    _ = try cwd.makeDir("./.git");
-    _ = try cwd.makeDir("./.git/objects");
-    _ = try cwd.makeDir("./.git/refs");
+    try cwd.makePath("./.git/objects");
+    try cwd.makePath("./.git/refs");
     {
         const head = try cwd.createFile("./.git/HEAD", .{});
         defer head.close();
@@ -186,7 +306,7 @@ fn lsTree(stdout: AnyWriter, hash: []const u8, name_only: bool) !void {
     while (true) {
         const mode = try de.reader().readUntilDelimiterOrEofAlloc(allocator, ' ', 256) orelse break;
         defer allocator.free(mode);
-        const object_type = if (strEql(mode, "40000")) "tree" else "blob";
+        const object_type: ObjectType = if (strEql(mode, "40000")) .tree else .blob;
 
         // There probably aren't filesystems that support 1MB filenames
         const name = try de.reader().readUntilDelimiterAlloc(allocator, '\x00', 1024 * 1024);
@@ -198,12 +318,21 @@ fn lsTree(stdout: AnyWriter, hash: []const u8, name_only: bool) !void {
         }
 
         if (!name_only) {
-            try stdout.print("{s} {s} {}\t", .{
+            try stdout.print("{s:0>6} {s} {}\t", .{
                 mode,
-                object_type,
+                @tagName(object_type),
                 std.fmt.fmtSliceHexLower(&object_hash),
             });
         }
         try stdout.print("{s}\n", .{name});
     }
+}
+
+fn writeTree(stdout: AnyWriter) !void {
+    const allocator = gpa.allocator();
+
+    var cwd = try fs.cwd().openDir(".", .{ .iterate = true });
+    defer cwd.close();
+    const raw_hash = try treeWrite(allocator, cwd);
+    try stdout.print("{}\n", .{std.fmt.fmtSliceHexLower(&raw_hash)});
 }
