@@ -9,6 +9,7 @@ const PAGE_SIZE = 4096;
 const ObjectType = enum {
     blob,
     tree,
+    commit,
 };
 
 const TreeEntry = struct {
@@ -85,6 +86,56 @@ pub fn main() !void {
         try lsTree(stdout, hash, name_only);
     } else if (strEql(command, "write-tree")) {
         try writeTree(stdout);
+    } else if (strEql(command, "commit-tree")) {
+        if (args.len < 5) {
+            try stderr.print("Usage: {s} commit-tree <tree_sha> [-p <commit_hash>] -m <message>\n", .{args[0]});
+            return;
+        }
+
+        var tree_hash: ?[40]u8 = null;
+        var parents: std.ArrayList([40]u8) = .init(allocator);
+        defer parents.deinit();
+        var message: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < args.len) {
+            if (strEql(args[i], "-p")) {
+                i += 1;
+                if (i >= args.len) {
+                    try stderr.print("Missing parent commit hash after -p\n", .{});
+                    return;
+                }
+                if (args[i].len != 40) {
+                    try stderr.print("Invalid SHA hash: {s}\n", .{args[i]});
+                    return;
+                }
+                try parents.append(args[i][0..40].*);
+            } else if (strEql(args[i], "-m")) {
+                i += 1;
+                if (i >= args.len) {
+                    try stderr.print("Missing commit message after -m\n", .{});
+                    return;
+                }
+                message = args[i];
+            } else {
+                if (args[i].len != 40) {
+                    try stderr.print("Invalid SHA hash: {s}\n", .{args[i]});
+                    return;
+                }
+                tree_hash = args[i][0..40].*;
+            }
+            i += 1;
+        }
+
+        if (tree_hash == null) {
+            try stderr.print("Missing tree hash\n", .{});
+            return;
+        }
+        if (message == null or message.?.len == 0) {
+            try stderr.print("Missing commit message\n", .{});
+            return;
+        }
+
+        try commitTree(stdout, tree_hash.?, parents.items, message.?);
     } else {
         try stderr.print("Unknown command: {s}\n", .{command});
         return;
@@ -258,6 +309,19 @@ fn treeWrite(allocator: std.mem.Allocator, dir: fs.Dir) ![20]u8 {
     return raw_hash;
 }
 
+fn treeCommitNoHeader(writer: AnyWriter, tree_hash: [40]u8, parents: []const [40]u8, message: []const u8) !void {
+    try writer.print("tree {s}\n", .{tree_hash});
+    for (parents) |p| {
+        try writer.print("parent {s}\n", .{p});
+    }
+    // Fixed author and committer
+    // P.S. Luna was programming back in the COBOL era, I wonder if she even knows about git 🤔
+    const commit_time = std.time.timestamp();
+    try writer.print("author Himemori Luna <himemori.luna@nnaaaa.com> {d} +0000\n", .{commit_time});
+    try writer.print("committer Himemori Luna <himemori.luna@nnaaaa.com> {d} +0000\n", .{commit_time});
+    try writer.print("\n{s}\n", .{message});
+}
+
 fn init(stdout: AnyWriter) !void {
     const cwd = fs.cwd();
     try cwd.makePath("./.git/objects");
@@ -357,4 +421,39 @@ fn writeTree(stdout: AnyWriter) !void {
     defer cwd.close();
     const raw_hash = try treeWrite(allocator, cwd);
     try stdout.print("{}\n", .{std.fmt.fmtSliceHexLower(&raw_hash)});
+}
+
+fn commitTree(stdout: AnyWriter, tree_hash: [40]u8, parents: []const [40]u8, message: []const u8) !void {
+    const size = blk: {
+        var counter = std.io.countingWriter(std.io.null_writer);
+        treeCommitNoHeader(counter.writer().any(), tree_hash, parents, message) catch unreachable;
+        break :blk counter.bytes_written;
+    };
+
+    const raw_hash = blk: {
+        var hasher = std.crypto.hash.Sha1.init(.{});
+        writeObjectHeader(hasher.writer().any(), .commit, size) catch unreachable;
+        treeCommitNoHeader(hasher.writer().any(), tree_hash, parents, message) catch unreachable;
+        break :blk hasher.finalResult();
+    };
+    const hash = std.fmt.bytesToHex(raw_hash, .lower);
+
+    try stdout.print("{s}\n", .{hash});
+
+    const path = objectPath(hash);
+    if (fs.cwd().access(&path, .{})) {
+        // Commit already exists, no need to write it again
+        return;
+    } else |err| {
+        std.mem.doNotOptimizeAway(err);
+    }
+
+    try fs.cwd().makePath(fs.path.dirname(&path).?);
+    const commit = try fs.cwd().createFile(&path, .{});
+    defer commit.close();
+
+    var compressor = try std.compress.zlib.compressor(commit.writer(), .{});
+    try writeObjectHeader(compressor.writer().any(), .commit, size);
+    try treeCommitNoHeader(compressor.writer().any(), tree_hash, parents, message);
+    try compressor.finish();
 }
