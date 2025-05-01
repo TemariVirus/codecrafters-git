@@ -40,7 +40,11 @@ pub fn main() !void {
             try stderr.print("Usage: {s} cat-file -p <hash>\n", .{args[0]});
             return;
         }
-        try catFile(stdout, args[3]);
+        if (args[3].len != 40) {
+            try stderr.print("Invalid SHA hash {s}\n", .{args[3]});
+            return;
+        }
+        try catFile(stdout, args[3][0..40].*);
     } else if (strEql(command, "hash-object")) {
         if (args.len < 3) {
             try stderr.print("Usage: {s} hash-object [-w] <file>\n", .{args[0]});
@@ -65,12 +69,16 @@ pub fn main() !void {
         }
 
         var name_only = false;
-        var hash: []const u8 = undefined;
+        var hash: [40]u8 = undefined;
         for (args[2..]) |arg| {
             if (strEql(arg, "--name-only")) {
                 name_only = true;
             } else {
-                hash = arg;
+                if (arg.len != 40) {
+                    try stderr.print("Invalid SHA hash: {s}\n", .{arg});
+                    return;
+                }
+                hash = arg[0..40].*;
             }
         }
 
@@ -262,9 +270,9 @@ fn init(stdout: AnyWriter) !void {
     _ = try stdout.writeAll("Initialized git directory\n");
 }
 
-fn catFile(stdout: AnyWriter, hash: []const u8) !void {
+fn catFile(stdout: AnyWriter, hash: [40]u8) !void {
     const file = blk: {
-        const path = objectPath(hash[0..40].*);
+        const path = objectPath(hash);
         break :blk try fs.cwd().openFile(&path, .{});
     };
     defer file.close();
@@ -296,11 +304,11 @@ fn hashObject(stdout: AnyWriter, file_path: []const u8, write: bool) !void {
     }
 }
 
-fn lsTree(stdout: AnyWriter, hash: []const u8, name_only: bool) !void {
+fn lsTree(stdout: AnyWriter, hash: [40]u8, name_only: bool) !void {
     const allocator = gpa.allocator();
 
     const file = blk: {
-        const path = objectPath(hash[0..40].*);
+        const path = objectPath(hash);
         break :blk try fs.cwd().openFile(&path, .{});
     };
     defer file.close();
